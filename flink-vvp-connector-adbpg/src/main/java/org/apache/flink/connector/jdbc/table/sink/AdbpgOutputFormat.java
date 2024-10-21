@@ -62,6 +62,7 @@ import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.postgresql.copy.CopyManager;
 import org.postgresql.core.BaseConnection;
+import org.postgresql.util.PSQLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import static org.apache.flink.connector.jdbc.table.utils.AdbpgOptions.ACCESS_METHOD;
@@ -337,17 +338,24 @@ public class AdbpgOutputFormat extends RichOutputFormat<RowData> implements Clea
         }
         return res;
     }
-
+    
     private boolean getShardKeys() {
         boolean res = false;
         try {
             // 准备SQL查询
-            String sql = String.format("SELECT dp.distkey, string_agg(a.attname, ' ') AS distkeyname, dp.numsegments\n" +
-                    "            FROM  gp_distribution_policy dp\n" +
-                    "            JOIN pg_class c ON dp.localoid = c.oid\n" +
-                    "            JOIN pg_attribute a ON c.oid = a.attrelid\n" +
-                    "            WHERE c.relname = '%s' AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '%s') AND\n" +
-                    "            a.attnum = ANY(dp.distkey) GROUP BY dp.distkey, dp.numsegments;", this.tableName, this.targetSchema);
+            String sql = String.format("SELECT\n" +
+                    "    dp.distkey,\n" +
+                    "    string_agg(a.attname, ' ' ORDER BY dpk.ordinality) AS distkeyname,\n" +
+                    "    dp.numsegments\n" +
+                    "FROM gp_distribution_policy dp\n" +
+                    "JOIN pg_class c ON dp.localoid = c.oid\n" +
+                    "JOIN LATERAL unnest(dp.distkey) WITH ORDINALITY AS dpk(attnum, ordinality) ON TRUE\n" +
+                    "JOIN pg_attribute a ON c.oid = a.attrelid AND a.attnum = dpk.attnum\n" +
+                    "WHERE c.relname = '%s'\n" +
+                    "  AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '%s')\n" +
+                    "GROUP BY dp.distkey, dp.numsegments;", this.tableName, this.targetSchema);
+
+
             Statement statement = connection.createStatement();
             ResultSet rs = statement.executeQuery(sql);
 
@@ -972,7 +980,28 @@ public class AdbpgOutputFormat extends RichOutputFormat<RowData> implements Clea
                 }
                 String sql = adbpgDialect.getCopyStatement(tableName, fieldNamesStrs, "STDIN", conflictMode, support_upsert);
                 LOG.info("Writing data with sql:" + sql);
-                copyManager.copyIn(sql, inputStream);
+                try {
+                    copyManager.copyIn(sql, inputStream);
+                } catch (PSQLException e) {
+                    if (e.getMessage() != null && e.getMessage().contains("Database connection failed")) {
+                        LOG.error("Error during copyIn, reconnecting and retrying", e);
+                        // Reacquire the connection and retry
+                        if (baseConn != null && !baseConn.isClosed() && !baseConn.isValid(1)) { // isValid(timeout),timeout: seconds
+                            // Discard the invalid connection
+                            if (dataSource != null) {
+                                // We should close and discard druid connection firstly, then close base connection.
+                                // Otherwise, druid will try to recycle the closed base connection, and print unusable log.
+                                dataSource.discardConnection(baseConn);
+                            }
+                            DruidPooledConnection rawConn = dataSource.getConnection();
+                            baseConn = (BaseConnection) (rawConn.getConnection());
+                            copyManager = new CopyManager(baseConn);
+                            copyManager.copyIn(sql, inputStream);
+                        }
+                    } else {
+                        LOG.error("Error during copyIn", e);
+                    }
+                }
                 break;
             } catch (SQLException | IOException e) {
                 if ((e.getMessage() != null && e.getMessage().contains("duplicate key")
